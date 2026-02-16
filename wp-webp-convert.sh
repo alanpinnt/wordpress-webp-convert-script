@@ -333,6 +333,35 @@ TOTAL_SAVED=0
 CURRENT=0
 START_TIME=$(date +%s)
 
+# ─── Start PHP Batch Daemon (full mode only) ─────────────────────────────────
+# Instead of spawning PHP + reconnecting to the database for every image,
+# start a single persistent PHP process and pipe commands to it via coproc.
+# Content replacements (post_content, elementor_data) are accumulated inside
+# the PHP process and flushed in batches at the end — this turns ~32,000 full
+# table scans into ~200.
+
+if (( FILES_ONLY == 0 )); then
+    coproc PHP_DAEMON { php "$PHP_HELPER" batch "$WP_CONFIG" 2>/dev/null; }
+    PHP_DAEMON_PID_SAVED="$PHP_DAEMON_PID"
+
+    # Clean up daemon on exit or interrupt
+    cleanup_daemon() {
+        if [[ -n "${PHP_DAEMON_PID_SAVED:-}" ]] && kill -0 "$PHP_DAEMON_PID_SAVED" 2>/dev/null; then
+            exec {PHP_DAEMON[1]}>&- 2>/dev/null
+            wait "$PHP_DAEMON_PID_SAVED" 2>/dev/null
+        fi
+    }
+    trap cleanup_daemon EXIT
+
+    # Send a command to the PHP daemon and read the response.
+    # Each command produces exactly one response line.
+    php_cmd() {
+        printf '%s\n' "$1" >&"${PHP_DAEMON[1]}" 2>/dev/null || return 1
+        IFS= read -r REPLY <&"${PHP_DAEMON[0]}" || return 1
+        printf '%s' "$REPLY"
+    }
+fi
+
 if (( FILES_ONLY == 0 )); then
     echo "Processing $TRACKED_COUNT attachments..."
 else
@@ -400,7 +429,14 @@ while IFS= read -r REL_PATH; do
     # Get thumbnail list from database (full mode only)
     THUMB_LIST=""
     if (( FILES_ONLY == 0 )); then
-        THUMB_LIST=$(php "$PHP_HELPER" info "$WP_CONFIG" "$REL_PATH" 2>/dev/null || echo "")
+        DAEMON_RESP=$(php_cmd "$(printf 'INFO\t%s' "$REL_PATH")")
+        # Response: THUMBS\tthumb1\tthumb2\t...
+        if [[ "$DAEMON_RESP" == THUMBS* ]]; then
+            IFS=$'\t' read -ra THUMB_PARTS <<< "$DAEMON_RESP"
+            for (( ti=1; ti<${#THUMB_PARTS[@]}; ti++ )); do
+                [[ -n "${THUMB_PARTS[ti]}" ]] && THUMB_LIST+="${THUMB_PARTS[ti]}"$'\n'
+            done
+        fi
     fi
     DIR_OF_FILE=$(dirname "$FILEPATH")
 
@@ -474,20 +510,22 @@ while IFS= read -r REL_PATH; do
     # Remove original main file
     rm -f "$FILEPATH"
 
-    # Update database (full mode only)
+    # Update database metadata (full mode only)
+    # Only updates per-attachment indexed fields here (fast). Content and
+    # Elementor replacements are accumulated and flushed in batches at the end.
     if (( FILES_ONLY == 0 )); then
-        DB_RESULT=$(php "$PHP_HELPER" update "$WP_CONFIG" "$REL_PATH" "$WEBP_REL" "$FINAL_WIDTH" "$FINAL_HEIGHT" 2>/dev/null || echo "FAILED")
+        DB_RESULT=$(php_cmd "$(printf 'UPDATE\t%s\t%s\t%s\t%s' "$REL_PATH" "$WEBP_REL" "$FINAL_WIDTH" "$FINAL_HEIGHT")")
 
-        if [[ "$DB_RESULT" == FAILED ]]; then
-            fail "    Database update failed"
+        if [[ "$DB_RESULT" == ERROR* ]]; then
+            IFS=$'\t' read -ra ERR_PARTS <<< "$DB_RESULT"
+            fail "    Database update failed: ${ERR_PARTS[1]:-unknown}"
             echo "ERROR: DB update failed: $REL_PATH" >> "$LOG_FILE"
             ERRORS=$(( ERRORS + 1 ))
         else
-            # Parse attachment_id from result
-            ATTACH_ID=$(echo "$DB_RESULT" | grep -oP 'attachment_id=\K[0-9]+' || echo "?")
-            CONTENT_ROWS=$(echo "$DB_RESULT" | grep -oP 'content_rows=\K[0-9]+' || echo "0")
-            ELEM_ROWS=$(echo "$DB_RESULT" | grep -oP 'elementor_rows=\K[0-9]+' || echo "0")
-            echo -e "    Database: ${GREEN}✓${NC} attachment #${ATTACH_ID} (content: $CONTENT_ROWS, elementor: $ELEM_ROWS)"
+            # Response: META\t<attachment_id>
+            IFS=$'\t' read -ra META_PARTS <<< "$DB_RESULT"
+            ATTACH_ID="${META_PARTS[1]:-?}"
+            echo -e "    Database: ${GREEN}✓${NC} attachment #${ATTACH_ID} updated"
         fi
     fi
 
@@ -502,16 +540,30 @@ done < "$TRACKED_LIST"
 
 rm -f "$TRACKED_LIST"
 
-# ─── Flush Elementor Cache (full mode only) ──────────────────────────────────
+# ─── Batch Content Replacement (full mode only) ──────────────────────────────
+# All post_content and Elementor replacements were accumulated during the
+# processing loop. Now flush them in batched queries (50 per query) instead
+# of scanning the full posts table once per image.
 
 if (( FILES_ONLY == 0 && CONVERTED > 0 )); then
     echo ""
-    echo "Flushing Elementor CSS cache..."
-    FLUSH_RESULT=$(php "$PHP_HELPER" flush-cache "$WP_CONFIG" 2>/dev/null || echo "SKIPPED")
-    if [[ "$FLUSH_RESULT" == SKIPPED ]]; then
-        warn "Could not flush Elementor cache (may not be installed — this is fine)"
+    echo "Replacing image references in posts and Elementor data..."
+    REPLACE_RESULT=$(php_cmd "FLUSH-REPLACE")
+    if [[ "$REPLACE_RESULT" == REPLACED* ]]; then
+        IFS=$'\t' read -ra REPLACE_PARTS <<< "$REPLACE_RESULT"
+        CONTENT_ROWS="${REPLACE_PARTS[1]:-0}"
+        ELEM_ROWS="${REPLACE_PARTS[2]:-0}"
+        info "Content updated: $CONTENT_ROWS posts, $ELEM_ROWS Elementor entries"
     else
+        warn "Content replacement returned unexpected result: $REPLACE_RESULT"
+    fi
+
+    echo "Flushing Elementor CSS cache..."
+    FLUSH_RESULT=$(php_cmd "FLUSH-CACHE")
+    if [[ "$FLUSH_RESULT" == FLUSHED* ]]; then
         info "Elementor CSS cache cleared"
+    else
+        warn "Could not flush Elementor cache (may not be installed — this is fine)"
     fi
 fi
 

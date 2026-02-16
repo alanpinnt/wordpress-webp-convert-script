@@ -118,12 +118,17 @@ Settings summary:
     Resized:  1920x1080
     Converted: 142 KB (92% savings)
     Thumbnails: 4 converted
-    Database: ✓ attachment #1247 (content: 3, elementor: 1)
+    Database: ✓ attachment #1247 updated
 
 [2/2641] 2024/03/icon-small.png
     Skipped (12 KB < 50 KB)
 
 ...
+
+Replacing image references in posts and Elementor data...
+    ✓ Content updated: 847 posts, 132 Elementor entries
+Flushing Elementor CSS cache...
+    ✓ Elementor CSS cache cleared
 
 === Complete ===
     Converted:  2204 images
@@ -147,17 +152,27 @@ Settings summary:
 
 Full mode updates every place WordPress stores image references:
 
-| Location | How it's updated |
-|---|---|
-| `_wp_attached_file` (file path) | Direct string replacement |
-| `_wp_attachment_metadata` (serialized PHP) | Safe unserialize/modify/reserialize via PHP — raw SQL would corrupt it |
-| `wp_posts.guid` (attachment URL) | String replacement |
-| `wp_posts.post_mime_type` | Set to `image/webp` |
-| `wp_posts.post_content` (image URLs in posts) | String replacement for main image + all thumbnails |
-| `_elementor_data` (Elementor page builder JSON) | String replacement with both escaped and unescaped slash handling |
-| `_elementor_css` (Elementor CSS cache) | Deleted — Elementor regenerates it automatically on next page load |
+| Location | How it's updated | When |
+|---|---|---|
+| `_wp_attached_file` (file path) | Direct string replacement | Per image |
+| `_wp_attachment_metadata` (serialized PHP) | Safe unserialize/modify/reserialize via PHP — raw SQL would corrupt it | Per image |
+| `wp_posts.guid` (attachment URL) | String replacement | Per image |
+| `wp_posts.post_mime_type` | Set to `image/webp` | Per image |
+| `wp_posts.post_content` (image URLs in posts) | Batched string replacement for main image + all thumbnails | End of run |
+| `_elementor_data` (Elementor page builder JSON) | Batched string replacement with both escaped and unescaped slash handling | End of run |
+| `_elementor_css` (Elementor CSS cache) | Deleted — Elementor regenerates it automatically on next page load | End of run |
 
 The serialized `_wp_attachment_metadata` field is the reason a PHP helper exists. This field encodes string byte lengths (`s:24:"hero-banner.jpg"`), so changing a filename without updating the length prefix corrupts the data. The PHP helper safely deserializes, modifies, and reserializes it.
+
+### Batch Database Architecture
+
+The script uses a two-phase approach to minimize database load:
+
+**Phase 1 — Per-image metadata (during processing):** A single PHP process runs as a persistent daemon for the entire conversion run, connected to the database once. For each image, it updates only the per-attachment fields (`_wp_attached_file`, `_wp_attachment_metadata`, `guid`, `post_mime_type`) using fast, indexed queries. It also accumulates all filename changes (main images + thumbnails) in memory.
+
+**Phase 2 — Bulk content replacement (after processing):** All accumulated old→new path mappings are applied to `post_content` and `_elementor_data` in batched queries — 50 replacements per query using nested SQL `REPLACE()` calls. This turns what would be tens of thousands of full table scans into a few hundred, reducing a multi-hour process to minutes.
+
+The daemon architecture eliminates the overhead of spawning a new PHP process and opening a new database connection for every image. On a site with 2,000+ images, this can reduce full-mode runtime from 12+ hours to under 2 hours.
 
 ## Page Builder Support
 
@@ -174,7 +189,7 @@ The serialized `_wp_attachment_metadata` field is the reason a PHP helper exists
 | File | Purpose |
 |---|---|
 | `wp-webp-convert.sh` | Main script — interactive prompts, file backups, image resizing, WebP conversion |
-| `wp-webp-db-update.php` | PHP helper — all database operations, serialized metadata handling, Elementor support |
+| `wp-webp-db-update.php` | PHP helper — persistent daemon for database operations, serialized metadata handling, batched content replacement, Elementor support |
 
 Both files must be in the same directory. The bash script calls the PHP helper automatically.
 

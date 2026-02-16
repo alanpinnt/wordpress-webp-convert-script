@@ -13,6 +13,7 @@
  *   info        <wp-config> <relative-path>                Get thumbnail filenames (one per line)
  *   update      <wp-config> <old-path> <new-path> <w> <h>  Update all DB references for one image
  *   flush-cache <wp-config>                                Clear Elementor CSS cache
+ *   batch       <wp-config>                                Persistent daemon mode (reads commands from stdin)
  */
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -433,6 +434,304 @@ function cmd_flush_cache(array $config): int {
     return 0;
 }
 
+// ─── Batch Helpers ──────────────────────────────────────────────────────────
+// Used by cmd_batch() for persistent-connection daemon mode.
+
+function batch_get_thumbs(mysqli $db, string $prefix, string $rel_path): array {
+    $stmt = $db->prepare(
+        "SELECT pm2.meta_value AS metadata
+         FROM {$prefix}postmeta pm
+         LEFT JOIN {$prefix}postmeta pm2
+           ON pm2.post_id = pm.post_id AND pm2.meta_key = '_wp_attachment_metadata'
+         WHERE pm.meta_key = '_wp_attached_file' AND pm.meta_value = ?"
+    );
+    $stmt->bind_param('s', $rel_path);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $row = $result->fetch_assoc();
+    $stmt->close();
+
+    $thumbs = [];
+    if ($row && $row['metadata']) {
+        $metadata = @unserialize($row['metadata']);
+        if (is_array($metadata) && isset($metadata['sizes'])) {
+            foreach ($metadata['sizes'] as $size_data) {
+                if (isset($size_data['file'])) {
+                    $thumbs[] = $size_data['file'];
+                }
+            }
+        }
+    }
+
+    return $thumbs;
+}
+
+function batch_update_meta(mysqli $db, string $prefix, string $old_rel, string $new_rel, int $width, int $height): array {
+    $old_basename = basename($old_rel);
+    $new_basename = basename($new_rel);
+    $old_dir = dirname($old_rel);
+    if ($old_dir === '.') $old_dir = '';
+
+    $thumbnail_replacements = [];
+
+    // Find attachment ID
+    $stmt = $db->prepare(
+        "SELECT post_id FROM {$prefix}postmeta
+         WHERE meta_key = '_wp_attached_file' AND meta_value = ?"
+    );
+    $stmt->bind_param('s', $old_rel);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $row = $result->fetch_assoc();
+    $stmt->close();
+
+    if (!$row) {
+        return ['error' => "No attachment found for $old_rel"];
+    }
+
+    $attachment_id = (int)$row['post_id'];
+
+    // Update _wp_attached_file (plain string)
+    $stmt = $db->prepare(
+        "UPDATE {$prefix}postmeta SET meta_value = ?
+         WHERE post_id = ? AND meta_key = '_wp_attached_file'"
+    );
+    $stmt->bind_param('si', $new_rel, $attachment_id);
+    $stmt->execute();
+    $stmt->close();
+
+    // Update _wp_attachment_metadata (serialized — must unserialize/reserialize)
+    $stmt = $db->prepare(
+        "SELECT meta_value FROM {$prefix}postmeta
+         WHERE post_id = ? AND meta_key = '_wp_attachment_metadata'"
+    );
+    $stmt->bind_param('i', $attachment_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $meta_row = $result->fetch_assoc();
+    $stmt->close();
+
+    if ($meta_row && $meta_row['meta_value']) {
+        $metadata = @unserialize($meta_row['meta_value']);
+
+        if (is_array($metadata)) {
+            if (isset($metadata['file'])) {
+                $metadata['file'] = $new_rel;
+            }
+            if ($width > 0 && $height > 0) {
+                $metadata['width'] = $width;
+                $metadata['height'] = $height;
+            }
+            if (isset($metadata['sizes']) && is_array($metadata['sizes'])) {
+                foreach ($metadata['sizes'] as $size_name => &$size_data) {
+                    if (isset($size_data['file'])) {
+                        $old_thumb = $size_data['file'];
+                        $new_thumb = preg_replace('/\.(jpe?g|png)$/i', '.webp', $old_thumb);
+                        $size_data['file'] = $new_thumb;
+
+                        $old_thumb_rel = $old_dir !== '' ? $old_dir . '/' . $old_thumb : $old_thumb;
+                        $new_thumb_rel = $old_dir !== '' ? $old_dir . '/' . $new_thumb : $new_thumb;
+                        $thumbnail_replacements[] = ['old' => $old_thumb_rel, 'new' => $new_thumb_rel];
+                    }
+                    if (isset($size_data['mime-type'])) {
+                        $size_data['mime-type'] = 'image/webp';
+                    }
+                }
+                unset($size_data);
+            }
+
+            $new_meta = serialize($metadata);
+            $stmt = $db->prepare(
+                "UPDATE {$prefix}postmeta SET meta_value = ?
+                 WHERE post_id = ? AND meta_key = '_wp_attachment_metadata'"
+            );
+            $stmt->bind_param('si', $new_meta, $attachment_id);
+            $stmt->execute();
+            $stmt->close();
+        }
+    }
+
+    // Update GUID
+    $stmt = $db->prepare(
+        "UPDATE {$prefix}posts SET guid = REPLACE(guid, ?, ?)
+         WHERE ID = ? AND post_type = 'attachment'"
+    );
+    $stmt->bind_param('ssi', $old_basename, $new_basename, $attachment_id);
+    $stmt->execute();
+    $stmt->close();
+
+    // Update post_mime_type
+    $stmt = $db->prepare(
+        "UPDATE {$prefix}posts SET post_mime_type = 'image/webp'
+         WHERE ID = ? AND post_type = 'attachment'"
+    );
+    $stmt->bind_param('i', $attachment_id);
+    $stmt->execute();
+    $stmt->close();
+
+    return [
+        'attachment_id' => $attachment_id,
+        'thumb_replacements' => $thumbnail_replacements,
+    ];
+}
+
+function batch_replace_content(mysqli $db, string $prefix, array $replacements): array {
+    if (empty($replacements)) {
+        return ['content_rows' => 0, 'elementor_rows' => 0];
+    }
+
+    $batch_size = 50;
+    $content_rows = 0;
+    $elementor_rows = 0;
+
+    foreach (array_chunk($replacements, $batch_size) as $batch) {
+        // ── post_content replacements ────────────────────────────────────
+        $expr = 'post_content';
+        $conditions = [];
+        foreach ($batch as $r) {
+            $old = $db->real_escape_string($r['old']);
+            $new = $db->real_escape_string($r['new']);
+            $expr = "REPLACE($expr, '$old', '$new')";
+            $conditions[] = "post_content LIKE '%" . $db->real_escape_string($r['old']) . "%'";
+        }
+        $sql = "UPDATE {$prefix}posts SET post_content = $expr WHERE " . implode(' OR ', $conditions);
+        if ($db->query($sql)) {
+            $content_rows += max(0, $db->affected_rows);
+        }
+
+        // ── elementor_data replacements (unescaped paths) ────────────────
+        $expr = 'meta_value';
+        $conditions = [];
+        foreach ($batch as $r) {
+            $old = $db->real_escape_string($r['old']);
+            $new = $db->real_escape_string($r['new']);
+            $expr = "REPLACE($expr, '$old', '$new')";
+            $conditions[] = "meta_value LIKE '%" . $db->real_escape_string($r['old']) . "%'";
+        }
+        $sql = "UPDATE {$prefix}postmeta SET meta_value = $expr"
+             . " WHERE meta_key = '_elementor_data' AND (" . implode(' OR ', $conditions) . ")";
+        if ($db->query($sql)) {
+            $elementor_rows += max(0, $db->affected_rows);
+        }
+
+        // ── elementor_data replacements (escaped slashes: 2024\/03\/img) ─
+        $expr = 'meta_value';
+        $conditions = [];
+        $has_slashes = false;
+        foreach ($batch as $r) {
+            $old_esc = str_replace('/', '\\/', $r['old']);
+            $new_esc = str_replace('/', '\\/', $r['new']);
+            if ($old_esc !== $r['old']) {
+                $has_slashes = true;
+                $old = $db->real_escape_string($old_esc);
+                $new = $db->real_escape_string($new_esc);
+                $expr = "REPLACE($expr, '$old', '$new')";
+                $conditions[] = "meta_value LIKE '%" . $db->real_escape_string($old_esc) . "%'";
+            }
+        }
+        if ($has_slashes) {
+            $sql = "UPDATE {$prefix}postmeta SET meta_value = $expr"
+                 . " WHERE meta_key = '_elementor_data' AND (" . implode(' OR ', $conditions) . ")";
+            if ($db->query($sql)) {
+                $elementor_rows += max(0, $db->affected_rows);
+            }
+        }
+    }
+
+    return ['content_rows' => $content_rows, 'elementor_rows' => $elementor_rows];
+}
+
+function batch_flush_cache(mysqli $db, string $prefix): array {
+    $db->query("DELETE FROM {$prefix}postmeta WHERE meta_key = '_elementor_css'");
+    $post_css = max(0, $db->affected_rows);
+    $db->query("DELETE FROM {$prefix}options WHERE option_name = '_elementor_global_css'");
+    $db->query("DELETE FROM {$prefix}options WHERE option_name = '_elementor_css_updated_time'");
+
+    return ['count' => $post_css];
+}
+
+// ─── Command: batch ─────────────────────────────────────────────────────────
+// Persistent daemon mode. Keeps a single DB connection open and reads
+// tab-delimited commands from stdin, one per line. Each command produces
+// exactly one tab-delimited response line on stdout.
+//
+// Protocol:
+//   → INFO\t<rel_path>
+//   ← THUMBS\t<thumb1>\t<thumb2>\t...
+//
+//   → UPDATE\t<old_rel>\t<new_rel>\t<width>\t<height>
+//   ← META\t<attachment_id>            (content replacements accumulated internally)
+//   ← ERROR\t<message>
+//
+//   → FLUSH-REPLACE                    (processes all accumulated content replacements in batches)
+//   ← REPLACED\t<content_rows>\t<elementor_rows>
+//
+//   → FLUSH-CACHE
+//   ← FLUSHED\t<count>
+
+function cmd_batch(array $config): int {
+    $prefix = $config['table_prefix'];
+    validate_prefix($prefix);
+    $db = get_db($config);
+
+    // Accumulated content replacements (deferred until FLUSH-REPLACE)
+    $content_replacements = [];
+
+    while (($line = fgets(STDIN)) !== false) {
+        $line = rtrim($line, "\r\n");
+        if ($line === '') continue;
+
+        $parts = explode("\t", $line);
+        $cmd = $parts[0];
+
+        switch ($cmd) {
+            case 'INFO':
+                $rel_path = $parts[1] ?? '';
+                $thumbs = batch_get_thumbs($db, $prefix, $rel_path);
+                echo "THUMBS\t" . implode("\t", $thumbs) . "\n";
+                break;
+
+            case 'UPDATE':
+                $old_rel = $parts[1] ?? '';
+                $new_rel = $parts[2] ?? '';
+                $width = (int)($parts[3] ?? 0);
+                $height = (int)($parts[4] ?? 0);
+                $result = batch_update_meta($db, $prefix, $old_rel, $new_rel, $width, $height);
+                if (isset($result['error'])) {
+                    echo "ERROR\t" . $result['error'] . "\n";
+                } else {
+                    // Accumulate content replacements for deferred batch processing
+                    $content_replacements[] = ['old' => $old_rel, 'new' => $new_rel];
+                    foreach ($result['thumb_replacements'] as $tr) {
+                        $content_replacements[] = $tr;
+                    }
+                    echo "META\t" . $result['attachment_id'] . "\n";
+                }
+                break;
+
+            case 'FLUSH-REPLACE':
+                $result = batch_replace_content($db, $prefix, $content_replacements);
+                $content_replacements = [];
+                echo "REPLACED\t" . $result['content_rows'] . "\t" . $result['elementor_rows'] . "\n";
+                break;
+
+            case 'FLUSH-CACHE':
+                $result = batch_flush_cache($db, $prefix);
+                echo "FLUSHED\t" . $result['count'] . "\n";
+                break;
+
+            default:
+                echo "ERROR\tUnknown command: $cmd\n";
+                break;
+        }
+
+        flush();
+    }
+
+    $db->close();
+    return 0;
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 function main(int $argc, array $argv): int {
@@ -471,6 +770,9 @@ function main(int $argc, array $argv): int {
 
         case 'flush-cache':
             return cmd_flush_cache($config);
+
+        case 'batch':
+            return cmd_batch($config);
 
         default:
             err("Unknown command: $command");
