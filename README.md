@@ -1,4 +1,4 @@
-# WordPress WebP Image Converter
+# wordpress-webp-convert-script
 
 A bash + PHP script that batch-converts JPEG/PNG images to WebP in WordPress `wp-content/uploads/`, updating all database references so WordPress serves the new files seamlessly. No plugins, no external APIs, no ongoing overhead — run it once and your media library is smaller and faster.
 

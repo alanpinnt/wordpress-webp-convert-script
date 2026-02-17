@@ -28,6 +28,20 @@ info()  { echo -e "    ${GREEN}✓${NC} $*"; }
 warn()  { echo -e "    ${YELLOW}⚠${NC} $*"; }
 fail()  { echo -e "    ${RED}✗${NC} $*" >&2; }
 
+start_keepalive() {
+    ( while true; do printf '.'; sleep 5; done ) &
+    KEEPALIVE_PID=$!
+}
+
+stop_keepalive() {
+    if [[ -n "${KEEPALIVE_PID:-}" ]]; then
+        kill "$KEEPALIVE_PID" 2>/dev/null
+        wait "$KEEPALIVE_PID" 2>/dev/null
+    fi
+    KEEPALIVE_PID=""
+    printf '\n'
+}
+
 format_bytes() {
     local bytes=$1
     if (( bytes >= 1073741824 )); then
@@ -547,8 +561,10 @@ rm -f "$TRACKED_LIST"
 
 if (( FILES_ONLY == 0 && CONVERTED > 0 )); then
     echo ""
-    echo "Replacing image references in posts and Elementor data..."
+    echo -n "Replacing image references in posts and Elementor data..."
+    start_keepalive
     REPLACE_RESULT=$(php_cmd "FLUSH-REPLACE")
+    stop_keepalive
     if [[ "$REPLACE_RESULT" == REPLACED* ]]; then
         IFS=$'\t' read -ra REPLACE_PARTS <<< "$REPLACE_RESULT"
         CONTENT_ROWS="${REPLACE_PARTS[1]:-0}"
@@ -558,8 +574,10 @@ if (( FILES_ONLY == 0 && CONVERTED > 0 )); then
         warn "Content replacement returned unexpected result: $REPLACE_RESULT"
     fi
 
-    echo "Flushing Elementor CSS cache..."
+    echo -n "Flushing Elementor CSS cache..."
+    start_keepalive
     FLUSH_RESULT=$(php_cmd "FLUSH-CACHE")
+    stop_keepalive
     if [[ "$FLUSH_RESULT" == FLUSHED* ]]; then
         info "Elementor CSS cache cleared"
     else
