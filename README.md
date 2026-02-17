@@ -52,7 +52,7 @@ It's a great tool for shrinking your media library, but it rewrites files and da
 ## Quick Start
 
 ```bash
-git clone <repo-url> && cd wordpress-webp-convert
+git clone https://github.com/alanpinnt/wordpress-webp-convert-script.git && cd wordpress-webp-convert
 chmod +x wp-webp-convert.sh
 ./wp-webp-convert.sh
 ```
