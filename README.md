@@ -101,6 +101,9 @@ Mode (1/2): 1
 [7] Minimum file size to process in KB (default 50): 50
     ✓ Skipping files under 50 KB
 
+[8] Parallel conversion workers (default 8): 8
+    ✓ Parallel workers: 8
+
 Settings summary:
     Uploads:     /var/www/html/wp-content/uploads
     Database:    wp_mysite (localhost)
@@ -109,19 +112,28 @@ Settings summary:
     Max size:    1920x1080
     Resize to:   1920x1080
     Min file:    50 KB
+    Workers:     8 parallel
 
-[8] Ready to process. Proceed? (y/n): y
+[9] Ready to process. Proceed? (y/n): y
 
-[1/2641] 2024/03/hero-banner.jpg
-    Original: 2560x1440, 1.8 MB
-    Resizing to fit 1920x1080...
-    Resized:  1920x1080
+Pre-fetching thumbnail info for 2641 attachments...
+    Pre-fetching thumbnail info: 2641/2641
+    ✓ Thumbnail info collected
+
+Converting 2641 images (8 parallel workers)...
+Log: ./wp-webp-convert-2026-02-14_143022.log
+
+    Progress: 2641/2641 images processed
+
+[1] 2024/03/hero-banner.jpg
     Converted: 142 KB (92% savings)
     Thumbnails: 4 converted
     Database: ✓ attachment #1247 updated
 
-[2/2641] 2024/03/icon-small.png
-    Skipped (12 KB < 50 KB)
+[2] 2024/03/product-photo.jpg
+    Converted: 89 KB (85% savings)
+    Thumbnails: 3 converted
+    Database: ✓ attachment #1248 updated
 
 ...
 
@@ -147,6 +159,7 @@ Flushing Elementor CSS cache...
 | **Max dimensions** | Images larger than this (width or height) get resized before conversion. |
 | **Resize target** | What oversized images get resized to. Aspect ratio is always preserved. |
 | **Minimum file size** | Files smaller than this are skipped (tiny icons/logos rarely benefit from WebP). |
+| **Parallel workers** | Number of images to convert simultaneously. Defaults to the number of CPU cores. Higher values use more CPU and I/O but finish faster. |
 
 ## What Gets Updated in the Database
 
@@ -158,21 +171,25 @@ Full mode updates every place WordPress stores image references:
 | `_wp_attachment_metadata` (serialized PHP) | Safe unserialize/modify/reserialize via PHP — raw SQL would corrupt it | Per image |
 | `wp_posts.guid` (attachment URL) | String replacement | Per image |
 | `wp_posts.post_mime_type` | Set to `image/webp` | Per image |
-| `wp_posts.post_content` (image URLs in posts) | Batched string replacement for main image + all thumbnails | End of run |
-| `_elementor_data` (Elementor page builder JSON) | Batched string replacement with both escaped and unescaped slash handling | End of run |
+| `wp_posts.post_content` (image URLs in posts) | Fetch affected rows, apply all replacements in PHP, write back changed rows in a transaction | End of run |
+| `_elementor_data` (Elementor page builder JSON) | Same fetch-modify-write approach with both escaped and unescaped slash handling | End of run |
 | `_elementor_css` (Elementor CSS cache) | Deleted — Elementor regenerates it automatically on next page load | End of run |
 
 The serialized `_wp_attachment_metadata` field is the reason a PHP helper exists. This field encodes string byte lengths (`s:24:"hero-banner.jpg"`), so changing a filename without updating the length prefix corrupts the data. The PHP helper safely deserializes, modifies, and reserializes it.
 
-### Batch Database Architecture
+### Processing Architecture
 
-The script uses a two-phase approach to minimize database load:
+The script uses a four-phase approach that parallelizes image conversion and minimizes database load:
 
-**Phase 1 — Per-image metadata (during processing):** A single PHP process runs as a persistent daemon for the entire conversion run, connected to the database once. For each image, it updates only the per-attachment fields (`_wp_attached_file`, `_wp_attachment_metadata`, `guid`, `post_mime_type`) using fast, indexed queries. It also accumulates all filename changes (main images + thumbnails) in memory.
+**Phase 1 — Pre-fetch thumbnails:** Before any conversion starts, the script queries the PHP daemon for every image's thumbnail list and writes them to temp files. This allows the parallel conversion workers to handle thumbnails without needing database access.
 
-**Phase 2 — Bulk content replacement (after processing):** All accumulated old→new path mappings are applied to `post_content` and `_elementor_data` in batched queries — 50 replacements per query using nested SQL `REPLACE()` calls. This turns what would be tens of thousands of full table scans into a few hundred, reducing a multi-hour process to minutes.
+**Phase 2 — Parallel image conversion:** Images are converted in parallel using multiple worker processes (configurable, defaults to the number of CPU cores). Each worker independently handles resize, WebP conversion, and thumbnail conversion for one image, writing its result to an individual file. A progress counter updates in real time.
 
-The daemon architecture eliminates the overhead of spawning a new PHP process and opening a new database connection for every image. On a site with 2,000+ images, this can reduce full-mode runtime from 12+ hours to under 2 hours.
+**Phase 3 — Per-image metadata updates:** A single PHP process runs as a persistent daemon, connected to the database once. For each converted image, it updates only the per-attachment fields (`_wp_attached_file`, `_wp_attachment_metadata`, `guid`, `post_mime_type`) using fast, indexed queries. It also accumulates all filename changes (main images + thumbnails) in memory.
+
+**Phase 4 — Bulk content replacement:** All accumulated old→new path mappings are applied to `post_content` and `_elementor_data`. The daemon identifies affected rows via chunked `LIKE` queries, fetches their content, applies all replacements in PHP using array `str_replace()`, and writes back only rows that actually changed — wrapped in a transaction for fast commits.
+
+The daemon architecture eliminates the overhead of spawning a new PHP process and opening a new database connection for every image. Parallel conversion with the fetch-modify-write database approach means a site with 2,000+ images typically completes in 15-25 minutes.
 
 ## Page Builder Support
 
@@ -188,8 +205,8 @@ The daemon architecture eliminates the overhead of spawning a new PHP process an
 
 | File | Purpose |
 |---|---|
-| `wp-webp-convert.sh` | Main script — interactive prompts, file backups, image resizing, WebP conversion |
-| `wp-webp-db-update.php` | PHP helper — persistent daemon for database operations, serialized metadata handling, batched content replacement, Elementor support |
+| `wp-webp-convert.sh` | Main script — interactive prompts, file backups, parallel image conversion (resize + WebP) |
+| `wp-webp-db-update.php` | PHP helper — persistent daemon for database operations, serialized metadata handling, content replacement, Elementor support |
 
 Both files must be in the same directory. The bash script calls the PHP helper automatically.
 

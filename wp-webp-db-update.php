@@ -580,61 +580,120 @@ function batch_replace_content(mysqli $db, string $prefix, array $replacements):
         return ['content_rows' => 0, 'elementor_rows' => 0];
     }
 
-    $batch_size = 50;
+    $chunk_size = 100;
     $content_rows = 0;
     $elementor_rows = 0;
 
-    foreach (array_chunk($replacements, $batch_size) as $batch) {
-        // ── post_content replacements ────────────────────────────────────
-        $expr = 'post_content';
-        $conditions = [];
-        foreach ($batch as $r) {
-            $old = $db->real_escape_string($r['old']);
-            $new = $db->real_escape_string($r['new']);
-            $expr = "REPLACE($expr, '$old', '$new')";
-            $conditions[] = "post_content LIKE '%" . $db->real_escape_string($r['old']) . "%'";
-        }
-        $sql = "UPDATE {$prefix}posts SET post_content = $expr WHERE " . implode(' OR ', $conditions);
-        if ($db->query($sql)) {
-            $content_rows += max(0, $db->affected_rows);
-        }
+    // Build old/new arrays for str_replace (much faster than per-replacement loops)
+    $old_values = array_column($replacements, 'old');
+    $new_values = array_column($replacements, 'new');
 
-        // ── elementor_data replacements (unescaped paths) ────────────────
-        $expr = 'meta_value';
+    // ── post_content: find affected posts, fetch, replace in PHP, write back ──
+
+    $affected_post_ids = [];
+    foreach (array_chunk($replacements, $chunk_size) as $chunk) {
         $conditions = [];
-        foreach ($batch as $r) {
-            $old = $db->real_escape_string($r['old']);
-            $new = $db->real_escape_string($r['new']);
-            $expr = "REPLACE($expr, '$old', '$new')";
-            $conditions[] = "meta_value LIKE '%" . $db->real_escape_string($r['old']) . "%'";
+        foreach ($chunk as $r) {
+            $escaped = $db->real_escape_string($r['old']);
+            $conditions[] = "post_content LIKE '%{$escaped}%'";
         }
-        $sql = "UPDATE {$prefix}postmeta SET meta_value = $expr"
+        $sql = "SELECT ID FROM {$prefix}posts WHERE " . implode(' OR ', $conditions);
+        $result = $db->query($sql);
+        if ($result) {
+            while ($row = $result->fetch_assoc()) {
+                $affected_post_ids[(int)$row['ID']] = true;
+            }
+        }
+    }
+
+    if (!empty($affected_post_ids)) {
+        $db->begin_transaction();
+        try {
+            $ids = array_keys($affected_post_ids);
+            foreach (array_chunk($ids, 500) as $id_chunk) {
+                $placeholders = implode(',', $id_chunk);
+                $sql = "SELECT ID, post_content FROM {$prefix}posts WHERE ID IN ($placeholders)";
+                $result = $db->query($sql);
+                if (!$result) continue;
+
+                $update_stmt = $db->prepare("UPDATE {$prefix}posts SET post_content = ? WHERE ID = ?");
+                while ($row = $result->fetch_assoc()) {
+                    $new_content = str_replace($old_values, $new_values, $row['post_content']);
+                    if ($new_content !== $row['post_content']) {
+                        $update_stmt->bind_param('si', $new_content, $row['ID']);
+                        $update_stmt->execute();
+                        $content_rows++;
+                    }
+                }
+                $update_stmt->close();
+            }
+            $db->commit();
+        } catch (Exception $e) {
+            $db->rollback();
+            throw $e;
+        }
+    }
+
+    // ── Elementor _elementor_data: same fetch-modify-write approach ──
+    // Build extended replacement arrays including JSON-escaped slash versions
+
+    $elem_old = $old_values;
+    $elem_new = $new_values;
+    foreach ($replacements as $r) {
+        $old_esc = str_replace('/', '\\/', $r['old']);
+        $new_esc = str_replace('/', '\\/', $r['new']);
+        if ($old_esc !== $r['old']) {
+            $elem_old[] = $old_esc;
+            $elem_new[] = $new_esc;
+        }
+    }
+
+    $affected_meta_ids = [];
+    foreach (array_chunk($replacements, $chunk_size) as $chunk) {
+        $conditions = [];
+        foreach ($chunk as $r) {
+            $escaped = $db->real_escape_string($r['old']);
+            $conditions[] = "meta_value LIKE '%{$escaped}%'";
+            $json_escaped = $db->real_escape_string(str_replace('/', '\\/', $r['old']));
+            if ($json_escaped !== $escaped) {
+                $conditions[] = "meta_value LIKE '%{$json_escaped}%'";
+            }
+        }
+        $sql = "SELECT meta_id FROM {$prefix}postmeta"
              . " WHERE meta_key = '_elementor_data' AND (" . implode(' OR ', $conditions) . ")";
-        if ($db->query($sql)) {
-            $elementor_rows += max(0, $db->affected_rows);
+        $result = $db->query($sql);
+        if ($result) {
+            while ($row = $result->fetch_assoc()) {
+                $affected_meta_ids[(int)$row['meta_id']] = true;
+            }
         }
+    }
 
-        // ── elementor_data replacements (escaped slashes: 2024\/03\/img) ─
-        $expr = 'meta_value';
-        $conditions = [];
-        $has_slashes = false;
-        foreach ($batch as $r) {
-            $old_esc = str_replace('/', '\\/', $r['old']);
-            $new_esc = str_replace('/', '\\/', $r['new']);
-            if ($old_esc !== $r['old']) {
-                $has_slashes = true;
-                $old = $db->real_escape_string($old_esc);
-                $new = $db->real_escape_string($new_esc);
-                $expr = "REPLACE($expr, '$old', '$new')";
-                $conditions[] = "meta_value LIKE '%" . $db->real_escape_string($old_esc) . "%'";
+    if (!empty($affected_meta_ids)) {
+        $db->begin_transaction();
+        try {
+            $ids = array_keys($affected_meta_ids);
+            foreach (array_chunk($ids, 500) as $id_chunk) {
+                $placeholders = implode(',', $id_chunk);
+                $sql = "SELECT meta_id, meta_value FROM {$prefix}postmeta WHERE meta_id IN ($placeholders)";
+                $result = $db->query($sql);
+                if (!$result) continue;
+
+                $update_stmt = $db->prepare("UPDATE {$prefix}postmeta SET meta_value = ? WHERE meta_id = ?");
+                while ($row = $result->fetch_assoc()) {
+                    $new_value = str_replace($elem_old, $elem_new, $row['meta_value']);
+                    if ($new_value !== $row['meta_value']) {
+                        $update_stmt->bind_param('si', $new_value, $row['meta_id']);
+                        $update_stmt->execute();
+                        $elementor_rows++;
+                    }
+                }
+                $update_stmt->close();
             }
-        }
-        if ($has_slashes) {
-            $sql = "UPDATE {$prefix}postmeta SET meta_value = $expr"
-                 . " WHERE meta_key = '_elementor_data' AND (" . implode(' OR ', $conditions) . ")";
-            if ($db->query($sql)) {
-                $elementor_rows += max(0, $db->affected_rows);
-            }
+            $db->commit();
+        } catch (Exception $e) {
+            $db->rollback();
+            throw $e;
         }
     }
 

@@ -313,6 +313,18 @@ MIN_SIZE_BYTES=$(( MIN_SIZE_KB * 1024 ))
 info "Skipping files under ${MIN_SIZE_KB} KB"
 echo ""
 
+# ── Step: Parallel workers ───────────────────────────────────────────
+
+STEP=$(( STEP + 1 ))
+DETECTED_CORES=$(nproc 2>/dev/null || echo 4)
+read -rp "[$STEP] Parallel conversion workers (default $DETECTED_CORES): " PARALLEL_JOBS
+PARALLEL_JOBS=${PARALLEL_JOBS:-$DETECTED_CORES}
+if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || (( PARALLEL_JOBS < 1 )); then
+    PARALLEL_JOBS=$DETECTED_CORES
+fi
+info "Parallel workers: $PARALLEL_JOBS"
+echo ""
+
 # ── Step: Confirm ─────────────────────────────────────────────────────────
 
 STEP=$(( STEP + 1 ))
@@ -328,6 +340,7 @@ echo "    Quality:     $WEBP_QUALITY"
 echo "    Max size:    ${MAX_WIDTH}x${MAX_HEIGHT}"
 echo "    Resize to:   ${TARGET_WIDTH}x${TARGET_HEIGHT}"
 echo "    Min file:    ${MIN_SIZE_KB} KB"
+echo "    Workers:     $PARALLEL_JOBS parallel"
 echo ""
 read -rp "[$STEP] Ready to process. Proceed? (y/n): " CONFIRM
 if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
@@ -344,28 +357,28 @@ CONVERTED=0
 SKIPPED=0
 ERRORS=0
 TOTAL_SAVED=0
-CURRENT=0
 START_TIME=$(date +%s)
 
+# Create temp work directory for parallel processing
+WORK_DIR=$(mktemp -d)
+RESULTS_DIR="$WORK_DIR/results"
+THUMB_DIR="$WORK_DIR/thumbs"
+mkdir -p "$RESULTS_DIR" "$THUMB_DIR"
+
 # ─── Start PHP Batch Daemon (full mode only) ─────────────────────────────────
-# Instead of spawning PHP + reconnecting to the database for every image,
-# start a single persistent PHP process and pipe commands to it via coproc.
-# Content replacements (post_content, elementor_data) are accumulated inside
-# the PHP process and flushed in batches at the end — this turns ~32,000 full
-# table scans into ~200.
+
+cleanup() {
+    rm -rf "$WORK_DIR" 2>/dev/null
+    if [[ -n "${PHP_DAEMON_PID_SAVED:-}" ]] && kill -0 "$PHP_DAEMON_PID_SAVED" 2>/dev/null; then
+        exec {PHP_DAEMON[1]}>&- 2>/dev/null
+        wait "$PHP_DAEMON_PID_SAVED" 2>/dev/null
+    fi
+}
+trap cleanup EXIT
 
 if (( FILES_ONLY == 0 )); then
     coproc PHP_DAEMON { php "$PHP_HELPER" batch "$WP_CONFIG" 2>/dev/null; }
     PHP_DAEMON_PID_SAVED="$PHP_DAEMON_PID"
-
-    # Clean up daemon on exit or interrupt
-    cleanup_daemon() {
-        if [[ -n "${PHP_DAEMON_PID_SAVED:-}" ]] && kill -0 "$PHP_DAEMON_PID_SAVED" 2>/dev/null; then
-            exec {PHP_DAEMON[1]}>&- 2>/dev/null
-            wait "$PHP_DAEMON_PID_SAVED" 2>/dev/null
-        fi
-    }
-    trap cleanup_daemon EXIT
 
     # Send a command to the PHP daemon and read the response.
     # Each command produces exactly one response line.
@@ -376,188 +389,242 @@ if (( FILES_ONLY == 0 )); then
     }
 fi
 
+# ─── Phase 1: Pre-fetch thumbnail info (full mode only) ──────────────────────
+# Query the daemon for each image's thumbnails upfront so the parallel
+# conversion workers can process thumbnails without needing DB access.
+
 if (( FILES_ONLY == 0 )); then
-    echo "Processing $TRACKED_COUNT attachments..."
-else
-    echo "Processing $TRACKED_COUNT images..."
+    echo -n "Pre-fetching thumbnail info for $TRACKED_COUNT attachments..."
+    PREFETCH_CURRENT=0
+    while IFS= read -r REL_PATH; do
+        PREFETCH_CURRENT=$(( PREFETCH_CURRENT + 1 ))
+        KEY=$(printf '%s' "$REL_PATH" | md5sum | cut -d' ' -f1)
+        DAEMON_RESP=$(php_cmd "$(printf 'INFO\t%s' "$REL_PATH")")
+        if [[ "$DAEMON_RESP" == THUMBS$'\t'* ]]; then
+            printf '%s' "${DAEMON_RESP#THUMBS	}" | tr '\t' '\n' > "$THUMB_DIR/$KEY"
+        fi
+        if (( PREFETCH_CURRENT % 100 == 0 )); then
+            printf '\r    Pre-fetching thumbnail info: %d/%d' "$PREFETCH_CURRENT" "$TRACKED_COUNT"
+        fi
+    done < "$TRACKED_LIST"
+    printf '\r    Pre-fetching thumbnail info: %d/%d\n' "$TRACKED_COUNT" "$TRACKED_COUNT"
+    info "Thumbnail info collected"
+    echo ""
 fi
+
+# ─── Phase 2: Parallel image conversion ──────────────────────────────────────
+# Write a self-contained worker script that handles resize + cwebp for one
+# image plus its thumbnails. Workers write results to individual files in
+# RESULTS_DIR, avoiding the need for locking.
+
+WORKER_SCRIPT="$WORK_DIR/worker.sh"
+cat > "$WORKER_SCRIPT" << 'WORKER_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+REL_PATH="$1"
+FILEPATH="$UPLOADS_DIR/$REL_PATH"
+KEY=$(printf '%s' "$REL_PATH" | md5sum | cut -d' ' -f1)
+RESULT_FILE="$RESULTS_DIR/$KEY"
+
+# Check if file exists
+if [[ ! -f "$FILEPATH" ]]; then
+    WEBP_CHECK="${FILEPATH%.*}.webp"
+    if [[ -f "$WEBP_CHECK" ]]; then
+        printf 'SKIPPED\t%s\tWebP already exists\n' "$REL_PATH" > "$RESULT_FILE"
+    else
+        printf 'SKIPPED\t%s\tfile not found\n' "$REL_PATH" > "$RESULT_FILE"
+    fi
+    exit 0
+fi
+
+# Check file size
+FILE_SIZE=$(stat -c%s "$FILEPATH" 2>/dev/null || echo 0)
+if (( FILE_SIZE < MIN_SIZE_BYTES )); then
+    printf 'SKIPPED\t%s\t%s < %s KB\n' "$REL_PATH" "$FILE_SIZE" "$MIN_SIZE_KB" > "$RESULT_FILE"
+    exit 0
+fi
+
+# Get dimensions
+DIMENSIONS=$(identify -format '%wx%h' "$FILEPATH[0]" 2>/dev/null || echo "0x0")
+CUR_WIDTH="${DIMENSIONS%%x*}"
+CUR_HEIGHT="${DIMENSIONS##*x}"
+FINAL_WIDTH="$CUR_WIDTH"
+FINAL_HEIGHT="$CUR_HEIGHT"
+
+# Resize if exceeding max dimensions (maintain aspect ratio, only shrink)
+if (( CUR_WIDTH > MAX_WIDTH || CUR_HEIGHT > MAX_HEIGHT )); then
+    if ! mogrify -resize "${TARGET_WIDTH}x${TARGET_HEIGHT}>" -quality 95 "$FILEPATH" 2>/dev/null; then
+        printf 'ERROR\t%s\tresize failed\n' "$REL_PATH" > "$RESULT_FILE"
+        exit 0
+    fi
+    NEW_DIMS=$(identify -format '%wx%h' "$FILEPATH[0]" 2>/dev/null || echo "0x0")
+    FINAL_WIDTH="${NEW_DIMS%%x*}"
+    FINAL_HEIGHT="${NEW_DIMS##*x}"
+fi
+
+# Convert main image to WebP
+WEBP_PATH="${FILEPATH%.*}.webp"
+ORIG_SIZE=$(stat -c%s "$FILEPATH" 2>/dev/null || echo 0)
+
+if ! cwebp -q "$WEBP_QUALITY" "$FILEPATH" -o "$WEBP_PATH" -quiet 2>/dev/null; then
+    printf 'ERROR\t%s\tcwebp failed\n' "$REL_PATH" > "$RESULT_FILE"
+    exit 0
+fi
+
+WEBP_SIZE=$(stat -c%s "$WEBP_PATH" 2>/dev/null || echo 0)
+
+# Only keep if WebP is actually smaller
+if (( WEBP_SIZE >= ORIG_SIZE )); then
+    rm -f "$WEBP_PATH"
+    printf 'SKIPPED\t%s\tWebP not smaller\n' "$REL_PATH" > "$RESULT_FILE"
+    exit 0
+fi
+
+SAVED=$(( ORIG_SIZE - WEBP_SIZE ))
+SAVINGS_PCT=0
+if (( ORIG_SIZE > 0 )); then
+    SAVINGS_PCT=$(( (SAVED * 100) / ORIG_SIZE ))
+fi
+
+# Convert thumbnails
+THUMB_CONVERTED=0
+THUMB_SAVED=0
+DIR_OF_FILE=$(dirname "$FILEPATH")
+THUMB_FILE_LIST="$THUMB_DIR/$KEY"
+
+if [[ -f "$THUMB_FILE_LIST" ]]; then
+    while IFS= read -r THUMB_FILE; do
+        [[ -z "$THUMB_FILE" ]] && continue
+        THUMB_PATH="$DIR_OF_FILE/$THUMB_FILE"
+        [[ ! -f "$THUMB_PATH" ]] && continue
+
+        THUMB_WEBP="${THUMB_PATH%.*}.webp"
+        if cwebp -q "$WEBP_QUALITY" "$THUMB_PATH" -o "$THUMB_WEBP" -quiet 2>/dev/null; then
+            T_ORIG=$(stat -c%s "$THUMB_PATH" 2>/dev/null || echo 0)
+            T_WEBP=$(stat -c%s "$THUMB_WEBP" 2>/dev/null || echo 0)
+            if (( T_WEBP < T_ORIG )); then
+                THUMB_SAVED=$(( THUMB_SAVED + T_ORIG - T_WEBP ))
+                rm -f "$THUMB_PATH"
+                THUMB_CONVERTED=$(( THUMB_CONVERTED + 1 ))
+            else
+                rm -f "$THUMB_WEBP"
+            fi
+        fi
+    done < "$THUMB_FILE_LIST"
+fi
+
+# Remove original
+rm -f "$FILEPATH"
+
+WEBP_REL="${REL_PATH%.*}.webp"
+TOTAL_SAVED_IMG=$(( SAVED + THUMB_SAVED ))
+
+# Result: CONVERTED REL_PATH WEBP_REL FINAL_W FINAL_H TOTAL_SAVED SAVINGS_PCT THUMB_COUNT ORIG_SIZE WEBP_SIZE
+printf 'CONVERTED\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$REL_PATH" "$WEBP_REL" "$FINAL_WIDTH" "$FINAL_HEIGHT" \
+    "$TOTAL_SAVED_IMG" "$SAVINGS_PCT" "$THUMB_CONVERTED" "$ORIG_SIZE" "$WEBP_SIZE" \
+    > "$RESULT_FILE"
+WORKER_EOF
+chmod +x "$WORKER_SCRIPT"
+
+# Export variables for workers
+export UPLOADS_DIR WEBP_QUALITY MAX_WIDTH MAX_HEIGHT TARGET_WIDTH TARGET_HEIGHT
+export MIN_SIZE_BYTES MIN_SIZE_KB RESULTS_DIR THUMB_DIR
+
+echo "Converting $TRACKED_COUNT images ($PARALLEL_JOBS parallel workers)..."
 echo "Log: $LOG_FILE"
 echo ""
 
-while IFS= read -r REL_PATH; do
-    CURRENT=$(( CURRENT + 1 ))
-    FILEPATH="$UPLOADS_DIR/$REL_PATH"
-    LABEL="[$CURRENT/$TRACKED_COUNT]"
+# Run parallel conversion with progress monitoring
+xargs -d '\n' -P "$PARALLEL_JOBS" -I {} bash "$WORKER_SCRIPT" {} < "$TRACKED_LIST" &
+XARGS_PID=$!
 
-    # Check if file exists on disk
-    if [[ ! -f "$FILEPATH" ]]; then
-        # Check if webp version already exists (previous partial run)
-        WEBP_CHECK="${FILEPATH%.*}.webp"
-        if [[ -f "$WEBP_CHECK" ]]; then
-            if (( FILES_ONLY == 0 )); then
-                echo "$LABEL $REL_PATH — skipped (WebP already exists, may need DB update)" | tee -a "$LOG_FILE"
-            else
-                echo "$LABEL $REL_PATH — skipped (WebP already exists)" | tee -a "$LOG_FILE"
+while kill -0 "$XARGS_PID" 2>/dev/null; do
+    DONE=$(find "$RESULTS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    printf '\r    Progress: %d/%d images processed' "$DONE" "$TRACKED_COUNT"
+    sleep 1
+done
+wait "$XARGS_PID"
+DONE=$(find "$RESULTS_DIR" -maxdepth 1 -type f | wc -l)
+printf '\r    Progress: %d/%d images processed\n' "$DONE" "$TRACKED_COUNT"
+echo ""
+
+# ─── Phase 3: Process results + database updates ─────────────────────────────
+# Read conversion results, update counters, and send DB metadata updates
+# sequentially via the daemon (fast indexed queries).
+
+RESULT_CURRENT=0
+
+for RESULT_FILE in "$RESULTS_DIR"/*; do
+    [[ ! -f "$RESULT_FILE" ]] && continue
+    RESULT_CURRENT=$(( RESULT_CURRENT + 1 ))
+    IFS=$'\t' read -ra PARTS < "$RESULT_FILE"
+    STATUS="${PARTS[0]}"
+
+    case "$STATUS" in
+        CONVERTED)
+            REL_PATH="${PARTS[1]}"
+            WEBP_REL="${PARTS[2]}"
+            FINAL_WIDTH="${PARTS[3]}"
+            FINAL_HEIGHT="${PARTS[4]}"
+            IMG_SAVED="${PARTS[5]}"
+            SAVINGS_PCT="${PARTS[6]}"
+            THUMB_COUNT="${PARTS[7]}"
+            ORIG_SIZE="${PARTS[8]}"
+            WEBP_SIZE="${PARTS[9]}"
+
+            CONVERTED=$(( CONVERTED + 1 ))
+            TOTAL_SAVED=$(( TOTAL_SAVED + IMG_SAVED ))
+
+            echo -e "${BOLD}[$CONVERTED]${NC} $REL_PATH"
+            echo -e "    Converted: $(format_bytes "$WEBP_SIZE") (${GREEN}${SAVINGS_PCT}% savings${NC})"
+            if (( THUMB_COUNT > 0 )); then
+                echo "    Thumbnails: $THUMB_COUNT converted"
             fi
-        else
-            echo "$LABEL $REL_PATH — skipped (file not found on disk)" | tee -a "$LOG_FILE"
-        fi
-        SKIPPED=$(( SKIPPED + 1 ))
-        continue
-    fi
 
-    # Check file size
-    FILE_SIZE=$(stat -c%s "$FILEPATH" 2>/dev/null || echo 0)
-    if (( FILE_SIZE < MIN_SIZE_BYTES )); then
-        echo "$LABEL $REL_PATH — skipped ($(format_bytes "$FILE_SIZE") < ${MIN_SIZE_KB} KB)" | tee -a "$LOG_FILE"
-        SKIPPED=$(( SKIPPED + 1 ))
-        continue
-    fi
+            # Database metadata update (full mode only)
+            if (( FILES_ONLY == 0 )); then
+                DB_RESULT=$(php_cmd "$(printf 'UPDATE\t%s\t%s\t%s\t%s' "$REL_PATH" "$WEBP_REL" "$FINAL_WIDTH" "$FINAL_HEIGHT")")
 
-    echo -e "${BOLD}$LABEL${NC} $REL_PATH"
-
-    # Get current dimensions
-    DIMENSIONS=$(identify -format '%wx%h' "$FILEPATH[0]" 2>/dev/null || echo "0x0")
-    CUR_WIDTH="${DIMENSIONS%%x*}"
-    CUR_HEIGHT="${DIMENSIONS##*x}"
-    FINAL_WIDTH="$CUR_WIDTH"
-    FINAL_HEIGHT="$CUR_HEIGHT"
-
-    echo "    Original: ${CUR_WIDTH}x${CUR_HEIGHT}, $(format_bytes "$FILE_SIZE")"
-
-    # Resize if exceeding max dimensions (maintain aspect ratio, only shrink)
-    if (( CUR_WIDTH > MAX_WIDTH || CUR_HEIGHT > MAX_HEIGHT )); then
-        echo -e "    Resizing to fit ${TARGET_WIDTH}x${TARGET_HEIGHT}..."
-        if ! mogrify -resize "${TARGET_WIDTH}x${TARGET_HEIGHT}>" -quality 95 "$FILEPATH" 2>/dev/null; then
-            fail "    Resize failed — skipping"
-            echo "ERROR: resize failed: $REL_PATH" >> "$LOG_FILE"
-            ERRORS=$(( ERRORS + 1 ))
-            continue
-        fi
-        NEW_DIMS=$(identify -format '%wx%h' "$FILEPATH[0]" 2>/dev/null || echo "0x0")
-        FINAL_WIDTH="${NEW_DIMS%%x*}"
-        FINAL_HEIGHT="${NEW_DIMS##*x}"
-        echo "    Resized:  ${FINAL_WIDTH}x${FINAL_HEIGHT}"
-    fi
-
-    # Get thumbnail list from database (full mode only)
-    THUMB_LIST=""
-    if (( FILES_ONLY == 0 )); then
-        DAEMON_RESP=$(php_cmd "$(printf 'INFO\t%s' "$REL_PATH")")
-        # Response: THUMBS\tthumb1\tthumb2\t...
-        if [[ "$DAEMON_RESP" == THUMBS* ]]; then
-            IFS=$'\t' read -ra THUMB_PARTS <<< "$DAEMON_RESP"
-            for (( ti=1; ti<${#THUMB_PARTS[@]}; ti++ )); do
-                [[ -n "${THUMB_PARTS[ti]}" ]] && THUMB_LIST+="${THUMB_PARTS[ti]}"$'\n'
-            done
-        fi
-    fi
-    DIR_OF_FILE=$(dirname "$FILEPATH")
-
-    # Convert main image to WebP
-    WEBP_PATH="${FILEPATH%.*}.webp"
-    WEBP_REL="${REL_PATH%.*}.webp"
-    ORIG_SIZE=$(stat -c%s "$FILEPATH" 2>/dev/null || echo 0)
-
-    if ! cwebp -q "$WEBP_QUALITY" "$FILEPATH" -o "$WEBP_PATH" -quiet 2>/dev/null; then
-        fail "    Conversion failed — skipping"
-        echo "ERROR: cwebp failed: $REL_PATH" >> "$LOG_FILE"
-        ERRORS=$(( ERRORS + 1 ))
-        continue
-    fi
-
-    WEBP_SIZE=$(stat -c%s "$WEBP_PATH" 2>/dev/null || echo 0)
-
-    # Only keep if WebP is actually smaller
-    if (( WEBP_SIZE >= ORIG_SIZE )); then
-        rm -f "$WEBP_PATH"
-        echo "    Skipped: WebP not smaller than original" | tee -a "$LOG_FILE"
-        SKIPPED=$(( SKIPPED + 1 ))
-        continue
-    fi
-
-    SAVED=$(( ORIG_SIZE - WEBP_SIZE ))
-    TOTAL_SAVED=$(( TOTAL_SAVED + SAVED ))
-    if (( ORIG_SIZE > 0 )); then
-        SAVINGS_PCT=$(( (SAVED * 100) / ORIG_SIZE ))
-    else
-        SAVINGS_PCT=0
-    fi
-
-    echo -e "    Converted: $(format_bytes "$WEBP_SIZE") (${GREEN}${SAVINGS_PCT}% savings${NC})"
-
-    # Convert thumbnails (full mode only — in files-only mode thumbnails are individual entries)
-    THUMB_CONVERTED=0
-    THUMB_FAILED=0
-    if [[ -n "$THUMB_LIST" ]]; then
-        while IFS= read -r THUMB_FILE; do
-            [[ -z "$THUMB_FILE" ]] && continue
-            THUMB_PATH="$DIR_OF_FILE/$THUMB_FILE"
-
-            if [[ -f "$THUMB_PATH" ]]; then
-                THUMB_WEBP="${THUMB_PATH%.*}.webp"
-                if cwebp -q "$WEBP_QUALITY" "$THUMB_PATH" -o "$THUMB_WEBP" -quiet 2>/dev/null; then
-                    THUMB_ORIG_SIZE=$(stat -c%s "$THUMB_PATH" 2>/dev/null || echo 0)
-                    THUMB_WEBP_SIZE=$(stat -c%s "$THUMB_WEBP" 2>/dev/null || echo 0)
-                    # Only keep WebP if it's actually smaller
-                    if (( THUMB_WEBP_SIZE < THUMB_ORIG_SIZE )); then
-                        TOTAL_SAVED=$(( TOTAL_SAVED + THUMB_ORIG_SIZE - THUMB_WEBP_SIZE ))
-                        rm -f "$THUMB_PATH"
-                        THUMB_CONVERTED=$(( THUMB_CONVERTED + 1 ))
-                    else
-                        rm -f "$THUMB_WEBP"
-                    fi
+                if [[ "$DB_RESULT" == ERROR* ]]; then
+                    IFS=$'\t' read -ra ERR_PARTS <<< "$DB_RESULT"
+                    fail "    Database update failed: ${ERR_PARTS[1]:-unknown}"
+                    echo "ERROR: DB update failed: $REL_PATH" >> "$LOG_FILE"
+                    ERRORS=$(( ERRORS + 1 ))
                 else
-                    THUMB_FAILED=$(( THUMB_FAILED + 1 ))
+                    IFS=$'\t' read -ra META_PARTS <<< "$DB_RESULT"
+                    ATTACH_ID="${META_PARTS[1]:-?}"
+                    echo -e "    Database: ${GREEN}✓${NC} attachment #${ATTACH_ID} updated"
                 fi
             fi
-        done <<< "$THUMB_LIST"
-    fi
 
-    if (( THUMB_CONVERTED > 0 )); then
-        echo "    Thumbnails: $THUMB_CONVERTED converted"
-    fi
-    if (( THUMB_FAILED > 0 )); then
-        warn "    Thumbnails: $THUMB_FAILED failed"
-    fi
+            echo "CONVERTED: $REL_PATH → $WEBP_REL (saved ${SAVINGS_PCT}%, thumbs: ${THUMB_COUNT})" >> "$LOG_FILE"
+            ;;
 
-    # Remove original main file
-    rm -f "$FILEPATH"
+        SKIPPED)
+            REL_PATH="${PARTS[1]}"
+            REASON="${PARTS[2]}"
+            SKIPPED=$(( SKIPPED + 1 ))
+            echo "SKIPPED: $REL_PATH ($REASON)" >> "$LOG_FILE"
+            ;;
 
-    # Update database metadata (full mode only)
-    # Only updates per-attachment indexed fields here (fast). Content and
-    # Elementor replacements are accumulated and flushed in batches at the end.
-    if (( FILES_ONLY == 0 )); then
-        DB_RESULT=$(php_cmd "$(printf 'UPDATE\t%s\t%s\t%s\t%s' "$REL_PATH" "$WEBP_REL" "$FINAL_WIDTH" "$FINAL_HEIGHT")")
-
-        if [[ "$DB_RESULT" == ERROR* ]]; then
-            IFS=$'\t' read -ra ERR_PARTS <<< "$DB_RESULT"
-            fail "    Database update failed: ${ERR_PARTS[1]:-unknown}"
-            echo "ERROR: DB update failed: $REL_PATH" >> "$LOG_FILE"
+        ERROR)
+            REL_PATH="${PARTS[1]}"
+            REASON="${PARTS[2]}"
             ERRORS=$(( ERRORS + 1 ))
-        else
-            # Response: META\t<attachment_id>
-            IFS=$'\t' read -ra META_PARTS <<< "$DB_RESULT"
-            ATTACH_ID="${META_PARTS[1]:-?}"
-            echo -e "    Database: ${GREEN}✓${NC} attachment #${ATTACH_ID} updated"
-        fi
-    fi
-
-    if (( FILES_ONLY == 0 )); then
-        echo "CONVERTED: $REL_PATH → $WEBP_REL (saved ${SAVINGS_PCT}%, thumbs: $THUMB_CONVERTED)" >> "$LOG_FILE"
-    else
-        echo "CONVERTED: $REL_PATH → $WEBP_REL (saved ${SAVINGS_PCT}%)" >> "$LOG_FILE"
-    fi
-    CONVERTED=$(( CONVERTED + 1 ))
-
-done < "$TRACKED_LIST"
+            fail "$REL_PATH — $REASON"
+            echo "ERROR: $REASON: $REL_PATH" >> "$LOG_FILE"
+            ;;
+    esac
+done
 
 rm -f "$TRACKED_LIST"
 
-# ─── Batch Content Replacement (full mode only) ──────────────────────────────
-# All post_content and Elementor replacements were accumulated during the
-# processing loop. Now flush them in batched queries (50 per query) instead
-# of scanning the full posts table once per image.
+# ─── Phase 4: Batch Content Replacement (full mode only) ─────────────────────
+# All post_content and Elementor replacements were accumulated during Phase 3
+# UPDATE commands. Now flush them — the PHP daemon fetches affected rows,
+# applies all replacements in PHP, and writes back only changed rows.
 
 if (( FILES_ONLY == 0 && CONVERTED > 0 )); then
     echo ""
